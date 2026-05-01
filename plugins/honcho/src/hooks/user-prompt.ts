@@ -149,7 +149,7 @@ export async function handleUserPrompt(): Promise<void> {
     verboseApiResult("peer.context() -> representation (cached)", cachedContext?.representation);
     verboseList("peer.context() -> peerCard (cached)", cachedContext?.peerCard);
 
-    serveContext(config.peerName, cachedContext, true, sessionLink);
+    serveContext(config.peerName, cachedContext, true, sessionLink, shouldShowSessionLink);
     process.exit(0);
   }
 
@@ -167,7 +167,7 @@ export async function handleUserPrompt(): Promise<void> {
       markKnowledgeGraphRefreshed();
     }
     if (context) {
-      serveContext(config.peerName, context, false, sessionLink);
+      serveContext(config.peerName, context, false, sessionLink, shouldShowSessionLink);
       process.exit(0);
     }
   }
@@ -176,7 +176,7 @@ export async function handleUserPrompt(): Promise<void> {
   const staleContext = getStaleCachedUserContext();
   if (staleContext) {
     logHook("user-prompt", "Serving stale cache after timeout");
-    serveContext(config.peerName, staleContext, true, sessionLink);
+    serveContext(config.peerName, staleContext, true, sessionLink, shouldShowSessionLink);
   }
   // No cache at all — exit silently, context will arrive after session-start completes
 
@@ -191,8 +191,9 @@ function serveContext(
   context: any,
   cached: boolean,
   sessionLink?: string,
+  isFirstTurn: boolean = false,
 ): void {
-  const { parts: contextParts } = formatCachedContext(context, peerName);
+  const { parts: contextParts } = formatCachedContext(context, peerName, isFirstTurn);
   if (contextParts.length === 0) return;
 
   const visMsg = visContextLine("user-prompt", { cached });
@@ -255,7 +256,7 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
   return { context: contextResult };
 }
 
-function formatCachedContext(context: any, peerName: string): { parts: string[]; conclusionCount: number } {
+function formatCachedContext(context: any, peerName: string, isFirstTurn: boolean = false): { parts: string[]; conclusionCount: number } {
   const parts: string[] = [];
   let conclusionCount = 0;
   const rep = context?.representation;
@@ -268,9 +269,12 @@ function formatCachedContext(context: any, peerName: string): { parts: string[];
     if (summary) parts.push(`Relevant conclusions: ${summary}`);
   }
 
-  const peerCard = context?.peerCard;
-  if (peerCard?.length) {
-    parts.push(`Profile: ${peerCard.join("; ")}`);
+  // Peer card is verbose and stable — only inject on the first turn of a session.
+  if (isFirstTurn) {
+    const peerCard = context?.peerCard;
+    if (peerCard?.length) {
+      parts.push(`Profile: ${peerCard.join("; ")}`);
+    }
   }
 
   return { parts, conclusionCount };
