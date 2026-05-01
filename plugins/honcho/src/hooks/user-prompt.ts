@@ -1,5 +1,5 @@
 import { Honcho } from "@honcho-ai/sdk";
-import { loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin, getObservationMode, isLoggingEnabled } from "../config.js";
+import { loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin, getObservationMode, isLoggingEnabled, getRetrievalConfig } from "../config.js";
 import {
   getCachedUserContext,
   getStaleCachedUserContext,
@@ -138,12 +138,18 @@ export async function handleUserPrompt(): Promise<void> {
     process.exit(0);
   }
 
-  // Decide whether to refresh: TTL expired or message threshold hit
+  // Decide whether to refresh: TTL expired, message threshold hit, or alwaysFresh enabled
+  const retrieval = getRetrievalConfig();
+  const promptTopics = extractTopics(prompt);
+  const hasSearchableTopics = promptTopics.length > 0;
   const forceRefresh = shouldRefreshKnowledgeGraph();
   const cachedContext = getCachedUserContext();
   const cacheIsStale = isContextCacheStale();
+  // When alwaysFresh is enabled and the prompt has searchable topics, bypass the
+  // cache fast-path so the representation reflects the current prompt's relevance.
+  const skipCacheForRelevance = retrieval.alwaysFresh && hasSearchableTopics;
 
-  if (cachedContext && !cacheIsStale && !forceRefresh) {
+  if (cachedContext && !cacheIsStale && !forceRefresh && !skipCacheForRelevance) {
     // Fresh cache — serve instantly, no API call
     logCache("hit", "userContext", "fresh cache");
     verboseApiResult("peer.context() -> representation (cached)", cachedContext?.representation);
@@ -153,8 +159,8 @@ export async function handleUserPrompt(): Promise<void> {
     process.exit(0);
   }
 
-  // Cache is stale or threshold reached — try a fresh fetch with timeout
-  logCache("miss", "userContext", forceRefresh ? "threshold refresh" : "stale cache");
+  // Cache is stale, threshold reached, or relevance-fresh fetch requested — try a fresh fetch with timeout
+  logCache("miss", "userContext", forceRefresh ? "threshold refresh" : skipCacheForRelevance ? "relevance fresh" : "stale cache");
 
   const fetchResult = await Promise.race([
     fetchFreshContext(config, prompt).then(r => ({ ok: true as const, ...r })),
@@ -203,6 +209,7 @@ function serveContext(
 async function fetchFreshContext(config: any, prompt: string): Promise<{ context: any }> {
   const honcho = new Honcho(getHonchoClientOptions(config));
   const observationMode = getObservationMode(config);
+  const retrieval = getRetrievalConfig();
 
   // unified: user self-observations — query via userPeer (no target).
   // directional: ai cross-observations — query via aiPeer with target.
@@ -227,6 +234,8 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
       // The representation merges search hits with frequent/recent conclusions
       // into one timestamp-ordered string, so prompt-relevant lines get lost.
       // Query matched conclusions separately and let the formatter put them first.
+      // Thresholds come from retrieval config (searchMaxDistance/topK/maxConclusions);
+      // includeMostFrequent stays false so frequency pinning can't crowd out relevance.
       const conclusionScope = contextTarget
         ? contextPeer.conclusionsOf(contextTarget)
         : contextPeer.conclusions;
@@ -234,29 +243,31 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
         contextPeer.context({
           ...(contextTarget ? { target: contextTarget } : {}),
           searchQuery,
-          searchTopK: 5,
-          searchMaxDistance: 0.7,
-          maxConclusions: 15,
-          includeMostFrequent: true,
+          searchTopK: retrieval.searchTopK,
+          searchMaxDistance: retrieval.searchMaxDistance,
+          maxConclusions: retrieval.maxConclusions,
+          includeMostFrequent: false,
         }),
-        conclusionScope.query(searchQuery, 5).catch((): any[] => []),
+        conclusionScope.query(searchQuery, retrieval.searchTopK).catch((): any[] => []),
       ]);
       contextResult = ctx;
       if (contextResult && matched?.length) {
         contextResult.searchMatched = matched.map((c: any) => c.content).filter(Boolean);
       }
-      logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)}`, Date.now() - startTime, true);
+      logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)} (d<=${retrieval.searchMaxDistance})`, Date.now() - startTime, true);
     } catch (e) {
       // Search failed — fall through to static context
       logHook("user-prompt", `Search context failed, falling back to static: ${e}`);
     }
   }
 
-  // Fallback: static context (no search query)
+  // Fallback: static context (no search query, or search threw an error).
+  // Note: an empty search result is NOT a failure — it means "no relevant
+  // conclusions for this prompt" and we honor that by skipping the static fallback.
   if (!contextResult) {
     contextResult = await contextPeer.context({
       ...(contextTarget ? { target: contextTarget } : {}),
-      maxConclusions: 15,
+      maxConclusions: retrieval.maxConclusions,
       includeMostFrequent: true,
     });
     logApiCall(contextLabel, "GET", `static context`, Date.now() - startTime, true);
@@ -280,6 +291,7 @@ export function formatCachedContext(context: any, peerName: string, dedupSession
   let conclusionCount = 0;
   let totalDropped = 0;
   const rep = context?.representation;
+  const retrieval = getRetrievalConfig();
 
   // Cross-turn dedup (#40): one shared hash set, seeded from what this session has
   // already injected, so a conclusion never repeats turn after turn. Conclusions
@@ -311,14 +323,14 @@ export function formatCachedContext(context: any, peerName: string, dedupSession
   };
 
   const selected: string[] = [];
-  for (const c of context?.searchMatched ?? []) accept(String(c), 5, selected);
+  for (const c of context?.searchMatched ?? []) accept(String(c), retrieval.displayLimit, selected);
 
   if (typeof rep === "string" && rep.trim()) {
     const lines = rep.split("\n").filter((l: string) => l.trim() && !l.startsWith("#"));
     // Sort newest-first when lines carry a leading [timestamp]; otherwise keep order.
     const stamped = lines.map((l: string, i: number) => ({ l, t: l.match(/^\[([^\]]+)\]/)?.[1] ?? "", i }));
     stamped.sort((a, b) => (b.t.localeCompare(a.t)) || (a.i - b.i));
-    for (const { l } of stamped) accept(l, 5, selected);
+    for (const { l } of stamped) accept(l, retrieval.displayLimit, selected);
   }
 
   if (selected.length > 0) {
