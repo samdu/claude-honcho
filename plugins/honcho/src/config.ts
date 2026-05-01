@@ -31,6 +31,19 @@ export interface LocalContextConfig {
   maxEntries?: number;
 }
 
+export interface RetrievalConfig {
+  /** Cosine distance threshold (0.0-1.0). Lower = stricter relevance. Default: 0.4 */
+  searchMaxDistance?: number;
+  /** Top-K conclusions to retrieve from semantic search. Default: 10 */
+  searchTopK?: number;
+  /** Max conclusions returned from API. Default: 5 */
+  maxConclusions?: number;
+  /** Display cap on conclusions injected per turn. Default: 5 */
+  displayLimit?: number;
+  /** When true, always do a fresh search-based fetch on user-prompt instead of serving stale cache. Default: true */
+  alwaysFresh?: boolean;
+}
+
 export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "max";
 
 export type SessionStrategy = "per-directory" | "git-branch" | "chat-instance";
@@ -80,6 +93,7 @@ export interface HostConfig {
   messageUpload?: MessageUploadConfig;
   contextRefresh?: ContextRefreshConfig;
   localContext?: LocalContextConfig;
+  retrieval?: RetrievalConfig;
   endpoint?: HonchoEndpointConfig;
 }
 
@@ -166,6 +180,7 @@ interface HonchoFileConfig {
   contextRefresh?: ContextRefreshConfig;
   endpoint?: HonchoEndpointConfig;
   localContext?: LocalContextConfig;
+  retrieval?: RetrievalConfig;
   enabled?: boolean;
   logging?: boolean;
   sessionStrategy?: SessionStrategy;
@@ -222,6 +237,8 @@ export interface HonchoCLAUDEConfig {
   endpoint?: HonchoEndpointConfig;
   /** Local claude-context.md settings */
   localContext?: LocalContextConfig;
+  /** Retrieval / relevance threshold settings for context injection */
+  retrieval?: RetrievalConfig;
   /** Temporarily disable plugin (default: true) */
   enabled?: boolean;
   /** Enable file logging to ~/.honcho/ (default: true) */
@@ -331,6 +348,7 @@ function resolveConfig(raw: HonchoFileConfig, host: HonchoHost): HonchoCLAUDECon
     contextRefresh: hostBlock?.contextRefresh ?? raw.contextRefresh,
     endpoint: hostBlock?.endpoint ?? raw.endpoint,
     localContext: hostBlock?.localContext ?? raw.localContext,
+    retrieval: hostBlock?.retrieval ?? raw.retrieval,
     enabled: hostBlock?.enabled ?? raw.enabled,
     logging: hostBlock?.logging ?? raw.logging,
     globalOverride: raw.globalOverride,
@@ -485,6 +503,7 @@ export function saveConfig(config: HonchoCLAUDEConfig): void {
   setHostIfExplicit("messageUpload", config.messageUpload, existing.messageUpload);
   setHostIfExplicit("contextRefresh", config.contextRefresh, existing.contextRefresh);
   setHostIfExplicit("localContext", config.localContext, existing.localContext);
+  setHostIfExplicit("retrieval", config.retrieval, existing.retrieval);
   setHostIfExplicit("endpoint", config.endpoint, existing.endpoint);
 
   existing.hosts[host] = hostEntry;
@@ -618,6 +637,17 @@ export function getLocalContextConfig(): LocalContextConfig {
   const config = loadConfig();
   return {
     maxEntries: config?.localContext?.maxEntries ?? 50,
+  };
+}
+
+export function getRetrievalConfig(): Required<RetrievalConfig> {
+  const config = loadConfig();
+  return {
+    searchMaxDistance: config?.retrieval?.searchMaxDistance ?? 0.4,
+    searchTopK: config?.retrieval?.searchTopK ?? 10,
+    maxConclusions: config?.retrieval?.maxConclusions ?? 5,
+    displayLimit: config?.retrieval?.displayLimit ?? 5,
+    alwaysFresh: config?.retrieval?.alwaysFresh ?? true,
   };
 }
 
