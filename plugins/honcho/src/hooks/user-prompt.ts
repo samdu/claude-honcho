@@ -27,6 +27,10 @@ interface HookInput {
 const SKIP_CONTEXT_PATTERNS = [
   /^(yes|no|ok|sure|thanks|y|n|yep|nope|yeah|nah|continue|go ahead|do it|proceed)$/i,
   /^\//, // slash commands
+  /^<task-notification>/, // background task notifications, not user typing
+  /^\[autonomous wakeup\]/i, // self-triggered wakeup prompts
+  // Short confirmations / acknowledgements — not worth a fresh fetch
+  /^(merged|pr merged|that[‘’']?s? merged|push(ed)?|pushed please|commit and push( please)?|please commit( and push)?|please do,? and commit|yes please|yes please,? commit( and push)?|do it please|ok please|nice|cool|great|got it|perfect|done|next|continue please|yes yes yes)[\s,.!?]*$/i,
 ];
 
 const FETCH_TIMEOUT_MS = 4000;
