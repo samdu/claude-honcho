@@ -225,7 +225,7 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
         ...(contextTarget ? { target: contextTarget } : {}),
         searchQuery,
         searchTopK: 5,
-        searchMaxDistance: 0.7,
+        searchMaxDistance: 0.85,
         maxConclusions: 15,
         includeMostFrequent: true,
       });
