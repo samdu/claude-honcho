@@ -106,15 +106,13 @@ export async function handleSessionStart(): Promise<void> {
     setCachedSessionId(cwd, sessionName, session.id, claudeInstanceId);
 
     // Step 4: Add peers to session (materializes session server-side).
-    // The AI peer is added with observeMe:false so Honcho never builds a representation
-    // OF the assistant. Otherwise every assistant turn gets distilled into claude->claude
-    // self-observations — noise that is never queried (injection/dialectic only read the
-    // user peer) and which dominated the store (~97% of conclusions). In directional mode
-    // the AI peer still observeOthers:true so it can observe the user.
+    // Peer defaults (observeMe, observeOthers) are managed server-side —
+    // configure them via API or on app.honcho.dev. We only override observeOthers
+    // for the AI peer in directional mode so it can observe the user.
     const observationMode = getObservationMode(config);
     const peers: Parameters<typeof session.addPeers>[0] = observationMode === "directional"
-      ? [userPeer, [aiPeer, { observeOthers: true, observeMe: false }]]
-      : [userPeer, [aiPeer, { observeMe: false }]];
+      ? [userPeer, [aiPeer, { observeOthers: true }]]
+      : [userPeer, aiPeer];
     await session.addPeers(peers);
 
     // Only persist session names for per-directory strategy (stable names).
