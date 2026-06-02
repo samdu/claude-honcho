@@ -2,6 +2,8 @@ import { Honcho } from "@honcho-ai/sdk";
 import { loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin } from "../config.js";
 import { existsSync, readFileSync } from "fs";
 import {
+  getQueuedMessages,
+  markMessagesUploaded,
   generateClaudeSummary,
   saveClaudeLocalContext,
   loadClaudeLocalContext,
@@ -239,12 +241,28 @@ export async function handleSessionEnd(): Promise<void> {
   try {
     const honcho = new Honcho(getHonchoClientOptions(config));
 
-    const [session, aiPeer] = await Promise.all([
+    const [session, userPeer, aiPeer] = await Promise.all([
       honcho.session(sessionName),
+      honcho.peer(config.peerName),
       honcho.peer(config.aiPeer),
     ]);
 
-    logHook("session-end", `Processing ${assistantMessages.length} assistant msgs`);
+    // Build all upload batches before sending
+    const queuedMessages = getQueuedMessages(cwd);
+    logHook("session-end", `Processing ${queuedMessages.length} queued + ${assistantMessages.length} assistant msgs`);
+
+    const userMessages = queuedMessages.flatMap((msg) => {
+      const chunks = chunkContent(msg.content);
+      return chunks.map(chunk =>
+        userPeer.message(chunk, {
+          createdAt: msg.timestamp,
+          metadata: {
+            instance_id: msg.instanceId || undefined,
+            session_affinity: sessionName,
+          },
+        })
+      );
+    });
 
     const aiMessages = (config.saveMessages !== false && assistantMessages.length > 0)
       ? assistantMessages.flatMap((msg) => {
@@ -275,12 +293,12 @@ export async function handleSessionEnd(): Promise<void> {
     );
 
     // Single addMessages call with everything — one round trip instead of three.
-    const allMessages = [...aiMessages, endMarker];
+    const allMessages = [...userMessages, ...aiMessages, endMarker];
 
     if (allMessages.length > 0) {
       const meaningfulCount = assistantMessages.filter(m => m.isMeaningful).length;
       logApiCall("session.addMessages", "POST",
-        `${aiMessages.length} assistant (${meaningfulCount} meaningful) + 1 marker`);
+        `${userMessages.length} user + ${aiMessages.length} assistant (${meaningfulCount} meaningful) + 1 marker`);
 
       // Start API upload immediately; run animation concurrently.
       const uploadPromise = session.addMessages(allMessages);
@@ -315,19 +333,24 @@ export async function handleSessionEnd(): Promise<void> {
       }, 12_000);
       hardTimeout.unref();
 
+      let uploadSucceeded = false;
       await Promise.all([
-        uploadPromise.finally(() => {
+        uploadPromise.then(() => { uploadSucceeded = true; }).finally(() => {
           clearTimeout(hardTimeout);
           removeSigHandlers();
         }),
         playCooldown("saving memory"),
       ]);
+
+      if (uploadSucceeded && queuedMessages.length > 0) {
+        markMessagesUploaded(cwd);
+      }
     } else {
       await playCooldown("saving memory");
     }
 
     const meaningfulCount = assistantMessages.filter(m => m.isMeaningful).length;
-    logHook("session-end", `Session saved: ${assistantMessages.length} assistant msgs (${meaningfulCount} meaningful)`);
+    logHook("session-end", `Session saved: ${assistantMessages.length} assistant msgs (${meaningfulCount} meaningful), ${queuedMessages.length} queued msgs`);
     process.exit(0);
   } catch (error) {
     logHook("session-end", `Error: ${error}`, { error: String(error) });
