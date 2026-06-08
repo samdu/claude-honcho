@@ -807,11 +807,13 @@ export async function runMcpServer(): Promise<void> {
           const query = args?.query as string;
           const reasoningLevel = (args?.reasoning_level as string) ?? config.reasoningLevel ?? "medium";
 
-          // Dialectic genuinely takes ~5-8s server-side; the global 8s client cap leaves
-          // no headroom and causes intermittent timeouts. Give this one call a longer
+          // Dialectic genuinely takes tens of seconds server-side at high/max reasoning
+          // (a multi-step agentic tool loop + a large synthesis write). The global 8s
+          // client cap leaves no headroom and causes intermittent timeouts; even 30s
+          // was tripped by deep-recall queries (~41s observed). Give this one call a 60s
           // ceiling via a dedicated client. Other paths keep fast-fail, and the prompt-
           // injection path has its own 4s race, so prompt latency is unaffected.
-          const chatHoncho = new Honcho(getHonchoClientOptions(config, 30000));
+          const chatHoncho = new Honcho(getHonchoClientOptions(config, 60000));
           const chatPeer = await chatHoncho.peer(
             observationMode === "unified" ? config.peerName : config.aiPeer
           );
