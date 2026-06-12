@@ -16,7 +16,7 @@ import {
 } from "../cache.js";
 import { logHook, logApiCall, logCache, setLogContext } from "../log.js";
 import { visContextLine, visSkipMessage, addSystemMessage, verboseApiResult, verboseList } from "../visual.js";
-import { pickFresh } from "../dedup.js";
+import { normalizeLine, hashLine } from "../dedup.js";
 import { honchoSessionUrl } from "../styles.js";
 
 interface HookInput {
@@ -57,14 +57,10 @@ function extractTopics(prompt: string): string[] {
   const errors = prompt.match(/error[:\s]+[\w\s]+|failed[:\s]+[\w\s]+|exception[:\s]+[\w\s]+/gi) || [];
   topics.push(...errors.slice(0, 2));
 
-  if (topics.length > 0) {
-    return [...new Set(topics)];
-  }
-
-  // Fallback: meaningful words >3 chars minus stopwords
-  const stopwords = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'are', 'was', 'were', 'been', 'being', 'has', 'had', 'does', 'did', 'will', 'would', 'could', 'should', 'can', 'may', 'might', 'must', 'shall', 'need', 'want', 'like', 'just', 'also', 'more', 'some', 'what', 'when', 'where', 'which', 'who', 'how', 'why', 'all', 'each', 'every', 'both', 'few', 'most', 'other', 'into', 'over', 'such', 'only', 'same', 'than', 'very', 'your', 'make', 'take', 'come', 'give', 'look', 'think', 'know']);
-  const words = prompt.toLowerCase().match(/\b[a-z]{4,}\b/g) || [];
-  return [...new Set(words.filter(w => !stopwords.has(w)))].slice(0, 10);
+  // No keyword fallback: extracted word lists are English-only and produce
+  // low-signal queries for other languages. Callers fall back to the raw
+  // prompt, which embeds better for semantic search anyway.
+  return [...new Set(topics)];
 }
 
 function shouldSkipContextRetrieval(prompt: string): boolean {
@@ -218,22 +214,37 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
 
   const startTime = Date.now();
 
-  // Try search-based context first — returns conclusions relevant to the prompt
+  // Try search-based context first — returns conclusions relevant to the prompt.
+  // Fall back to the raw prompt (truncated) when no high-signal topics match:
+  // natural text embeds well, and it keeps non-English prompts working.
   const topics = extractTopics(prompt);
-  const searchQuery = topics.length > 0 ? topics.join(" ") : undefined;
+  const searchQuery = topics.length > 0 ? topics.join(" ") : prompt.trim().slice(0, 300);
 
   let contextResult: any = null;
 
   if (searchQuery) {
     try {
-      contextResult = await contextPeer.context({
-        ...(contextTarget ? { target: contextTarget } : {}),
-        searchQuery,
-        searchTopK: 5,
-        searchMaxDistance: 0.85,
-        maxConclusions: 15,
-        includeMostFrequent: true,
-      });
+      // The representation merges search hits with frequent/recent conclusions
+      // into one timestamp-ordered string, so prompt-relevant lines get lost.
+      // Query matched conclusions separately and let the formatter put them first.
+      const conclusionScope = contextTarget
+        ? contextPeer.conclusionsOf(contextTarget)
+        : contextPeer.conclusions;
+      const [ctx, matched] = await Promise.all([
+        contextPeer.context({
+          ...(contextTarget ? { target: contextTarget } : {}),
+          searchQuery,
+          searchTopK: 5,
+          searchMaxDistance: 0.7,
+          maxConclusions: 15,
+          includeMostFrequent: true,
+        }),
+        conclusionScope.query(searchQuery, 5).catch((): any[] => []),
+      ]);
+      contextResult = ctx;
+      if (contextResult && matched?.length) {
+        contextResult.searchMatched = matched.map((c: any) => c.content).filter(Boolean);
+      }
       logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)}`, Date.now() - startTime, true);
     } catch (e) {
       // Search failed — fall through to static context
@@ -260,52 +271,74 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
   return { context: contextResult };
 }
 
+function stripConclusionLine(line: string): string {
+  return line.replace(/^\[.*?\]\s*/, "").replace(/^- /, "").trim();
+}
+
 function formatCachedContext(context: any, peerName: string, dedupSessionId?: string): { parts: string[]; conclusionCount: number } {
   const parts: string[] = [];
   let conclusionCount = 0;
   let totalDropped = 0;
   const rep = context?.representation;
 
+  // Cross-turn dedup (#40): one shared hash set, seeded from what this session has
+  // already injected, so a conclusion never repeats turn after turn. Conclusions
+  // and the Profile below share it and we record() once at the end — recording per
+  // block would double-increment the session turn counter.
+  const alreadyHashed = dedupSessionId ? getInjectedHashesForSession(dedupSessionId) : null;
+  const freshHashes: string[] = [];
+
+  // Within-turn ordering (#63): prompt-matched conclusions first (semantic search),
+  // then the newest representation lines. The representation is oldest-first, so
+  // taking its head would inject the stalest facts.
+  const seen = new Set<string>();
+  const accept = (text: string, cap: number, out: string[]): void => {
+    const clean = stripConclusionLine(text);
+    if (!clean || out.length >= cap) return;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+    const hash = hashLine(normalizeLine(text));
+    if (alreadyHashed?.has(hash)) {
+      totalDropped = totalDropped + 1;
+      return;
+    }
+    seen.add(key);
+    out.push(clean);
+    if (alreadyHashed) {
+      alreadyHashed.add(hash);
+      freshHashes.push(hash);
+    }
+  };
+
+  const selected: string[] = [];
+  for (const c of context?.searchMatched ?? []) accept(String(c), 5, selected);
+
   if (typeof rep === "string" && rep.trim()) {
     const lines = rep.split("\n").filter((l: string) => l.trim() && !l.startsWith("#"));
-    let selected: string[];
-    if (dedupSessionId) {
-      const alreadyHashed = getInjectedHashesForSession(dedupSessionId);
-      const result = pickFresh(lines, alreadyHashed, 5);
-      selected = result.fresh;
-      conclusionCount = result.fresh.length;
-      totalDropped = totalDropped + result.droppedCount;
-      if (result.freshHashes.length > 0) {
-        recordInjectedHashes(dedupSessionId, result.freshHashes);
-      }
-      for (const h of result.freshHashes) {
-        alreadyHashed.add(h);
-      }
-    } else {
-      selected = lines.slice(0, 5);
-      conclusionCount = selected.length;
-    }
-    const summary = selected.map((l: string) => l.replace(/^\[.*?\]\s*/, "").replace(/^- /, "")).join("; ");
-    if (summary) parts.push(`Relevant conclusions: ${summary}`);
+    // Sort newest-first when lines carry a leading [timestamp]; otherwise keep order.
+    const stamped = lines.map((l: string, i: number) => ({ l, t: l.match(/^\[([^\]]+)\]/)?.[1] ?? "", i }));
+    stamped.sort((a, b) => (b.t.localeCompare(a.t)) || (a.i - b.i));
+    for (const { l } of stamped) accept(l, 5, selected);
   }
 
+  if (selected.length > 0) {
+    conclusionCount = selected.length;
+    parts.push(`Relevant conclusions: ${selected.join("; ")}`);
+  }
+
+  // Profile (peer card): same dedup gate. On the first turn the whole card is
+  // fresh; on later turns its lines are already hashed, so it collapses to nothing.
   const peerCard = context?.peerCard;
   if (peerCard?.length) {
-    let selectedPeerCard: string[];
-    if (dedupSessionId) {
-      const alreadyHashed = getInjectedHashesForSession(dedupSessionId);
-      const result = pickFresh(peerCard, alreadyHashed, peerCard.length);
-      selectedPeerCard = result.fresh;
-      totalDropped = totalDropped + result.droppedCount;
-      if (result.freshHashes.length > 0) {
-        recordInjectedHashes(dedupSessionId, result.freshHashes);
-      }
-    } else {
-      selectedPeerCard = peerCard;
-    }
+    const selectedPeerCard: string[] = [];
+    for (const line of peerCard) accept(String(line), peerCard.length, selectedPeerCard);
     if (selectedPeerCard.length > 0) {
       parts.push(`Profile: ${selectedPeerCard.join("; ")}`);
     }
+  }
+
+  if (dedupSessionId && freshHashes.length > 0) {
+    recordInjectedHashes(dedupSessionId, freshHashes);
   }
 
   if (totalDropped > 0 && isLoggingEnabled()) {
