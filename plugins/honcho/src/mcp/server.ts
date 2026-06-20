@@ -612,6 +612,25 @@ export async function runMcpServer(): Promise<void> {
           },
         },
         {
+          name: "query_conclusions",
+          description: "Semantically search the conclusions Honcho has saved about the user, ranked by relevance to a query. Use this (not list_conclusions) when you want what's remembered about a specific topic — e.g. 'salary expectations', 'hardware setup' — rather than a chronological dump.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "Natural-language search query",
+              },
+              top_k: {
+                type: "number",
+                description: "Max number of conclusions to return (default: 10)",
+                default: 10,
+              },
+            },
+            required: ["query"],
+          },
+        },
+        {
           name: "delete_conclusion",
           description: "Delete a conclusion from Honcho's memory by ID. Use list_conclusions to find the ID first.",
           inputSchema: {
@@ -721,7 +740,7 @@ export async function runMcpServer(): Promise<void> {
 
     // ── Peer-only tools (no session needed) ──
 
-    if (name === "list_conclusions" || name === "delete_conclusion") {
+    if (name === "list_conclusions" || name === "query_conclusions" || name === "delete_conclusion") {
       try {
         const observationMode = getObservationMode(config);
         // unified: (observer=user, observed=user); directional: (observer=aiPeer, observed=user)
@@ -729,6 +748,23 @@ export async function runMcpServer(): Promise<void> {
           ? await honcho.peer(config.peerName)
           : await honcho.peer(config.aiPeer);
         const conclusionScope = scopePeer.conclusionsOf(config.peerName);
+
+        if (name === "query_conclusions") {
+          const query = args?.query as string;
+          const topK = (args?.top_k as number) ?? 10;
+          const results = await conclusionScope.query(query, topK);
+          const items = results.map((c: any) => ({
+            id: c.id,
+            content: c.content,
+            createdAt: c.createdAt,
+          }));
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({ items, count: items.length }, null, 2),
+            }],
+          };
+        }
 
         if (name === "list_conclusions") {
           const page = (args?.page as number) ?? 1;

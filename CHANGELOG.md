@@ -2,6 +2,12 @@
 
 All notable changes to claude-honcho will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `query_conclusions` MCP tool — semantic search over saved conclusions (SDK `ConclusionScope.query`), ranked by relevance to a query with an optional `top_k`. Complements `list_conclusions`, which only pages chronologically.
+
 ## [0.2.4] - 2026-04-01
 
 ### Added
