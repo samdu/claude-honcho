@@ -722,12 +722,12 @@ export function getHonchoBaseUrl(config: HonchoCLAUDEConfig): string {
   return getHonchoBaseUrlForEndpoint(config.endpoint);
 }
 
-export function getHonchoClientOptions(config: HonchoCLAUDEConfig): HonchoClientOptions {
+export function getHonchoClientOptions(config: HonchoCLAUDEConfig, timeoutMs: number = 8000): HonchoClientOptions {
   return {
     apiKey: config.apiKey,
     baseURL: getHonchoBaseUrl(config),
     workspaceId: config.workspace,
-    timeout: 8000,
+    timeout: timeoutMs,
     maxRetries: 1,
   };
 }

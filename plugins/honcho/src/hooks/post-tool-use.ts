@@ -225,8 +225,13 @@ export async function handlePostToolUse(): Promise<void> {
   // INSTANT: Update local claude context file (~2ms)
   appendClaudeWork(summary);
 
-  // Upload to Honcho and wait for completion
-  await logToHonchoAsync(config, cwd, summary).catch((e) => logHook("post-tool-use", `Upload failed: ${e}`, { error: String(e) }));
+  // Tool calls are intentionally NOT uploaded to Honcho (2026-05-29, per Sam):
+  // the "[Tool] Ran: ..." messages polluted the corpus and skewed distillation
+  // (a single infra-heavy session reshaped the whole representation). Local
+  // work-context above is kept; conversation turns still flow via the stop hook.
+  // To re-enable, uncomment the call below.
+  // await logToHonchoAsync(config, cwd, summary).catch((e) => logHook("post-tool-use", `Upload failed: ${e}`, { error: String(e) }));
+  void logToHonchoAsync; // keep referenced to avoid unused-symbol lints
 
   process.exit(0);
 }
