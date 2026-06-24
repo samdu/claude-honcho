@@ -1,5 +1,5 @@
 import { Honcho } from "@honcho-ai/sdk";
-import { loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin, getObservationMode } from "../config.js";
+import { loadConfig, getSessionName, getHonchoClientOptions, isPluginEnabled, getCachedStdin, getObservationMode, isLoggingEnabled, getRetrievalConfig } from "../config.js";
 import {
   getCachedUserContext,
   getStaleCachedUserContext,
@@ -11,9 +11,12 @@ import {
   markKnowledgeGraphRefreshed,
   getInstanceIdForCwd,
   queueMessage,
+  getInjectedHashesForSession,
+  recordInjectedHashes,
 } from "../cache.js";
 import { logHook, logApiCall, logCache, setLogContext } from "../log.js";
 import { visContextLine, visSkipMessage, addSystemMessage, verboseApiResult, verboseList } from "../visual.js";
+import { normalizeLine, hashLine } from "../dedup.js";
 import { honchoSessionUrl } from "../styles.js";
 
 interface HookInput {
@@ -27,6 +30,10 @@ interface HookInput {
 const SKIP_CONTEXT_PATTERNS = [
   /^(yes|no|ok|sure|thanks|y|n|yep|nope|yeah|nah|continue|go ahead|do it|proceed)$/i,
   /^\//, // slash commands
+  /^<task-notification>/, // background task notifications, not user typing
+  /^\[autonomous wakeup\]/i, // self-triggered wakeup prompts
+  // Short confirmations / acknowledgements — not worth a fresh fetch
+  /^(merged|pr merged|that[‘’']?s? merged|push(ed)?|pushed please|commit and push( please)?|please commit( and push)?|please do,? and commit|yes please|yes please,? commit( and push)?|do it please|ok please|nice|cool|great|got it|perfect|done|next|continue please|yes yes yes)[\s,.!?]*$/i,
 ];
 
 const FETCH_TIMEOUT_MS = 4000;
@@ -35,7 +42,7 @@ const FETCH_TIMEOUT_MS = 4000;
  * Extract meaningful topics from a prompt for semantic search.
  * Returns terms that are high-signal for conclusion matching.
  */
-function extractTopics(prompt: string): string[] {
+export function extractTopics(prompt: string): string[] {
   const topics: string[] = [];
 
   // File paths (high signal)
@@ -54,14 +61,10 @@ function extractTopics(prompt: string): string[] {
   const errors = prompt.match(/error[:\s]+[\w\s]+|failed[:\s]+[\w\s]+|exception[:\s]+[\w\s]+/gi) || [];
   topics.push(...errors.slice(0, 2));
 
-  if (topics.length > 0) {
-    return [...new Set(topics)];
-  }
-
-  // Fallback: meaningful words >3 chars minus stopwords
-  const stopwords = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'are', 'was', 'were', 'been', 'being', 'has', 'had', 'does', 'did', 'will', 'would', 'could', 'should', 'can', 'may', 'might', 'must', 'shall', 'need', 'want', 'like', 'just', 'also', 'more', 'some', 'what', 'when', 'where', 'which', 'who', 'how', 'why', 'all', 'each', 'every', 'both', 'few', 'most', 'other', 'into', 'over', 'such', 'only', 'same', 'than', 'very', 'your', 'make', 'take', 'come', 'give', 'look', 'think', 'know']);
-  const words = prompt.toLowerCase().match(/\b[a-z]{4,}\b/g) || [];
-  return [...new Set(words.filter(w => !stopwords.has(w)))].slice(0, 10);
+  // No keyword fallback: extracted word lists are English-only and produce
+  // low-signal queries for other languages. Callers fall back to the raw
+  // prompt, which embeds better for semantic search anyway.
+  return [...new Set(topics)];
 }
 
 function shouldSkipContextRetrieval(prompt: string): boolean {
@@ -106,6 +109,7 @@ export async function handleUserPrompt(): Promise<void> {
   const prompt = hookInput.prompt || "";
   const cwd = hookInput.workspace_roots?.[0] || hookInput.cwd || process.cwd();
   const instanceId = hookInput.session_id || getInstanceIdForCwd(cwd);
+  const dedupSessionId = hookInput.session_id;
   const sessionName = getSessionName(cwd, instanceId || undefined);
 
   setLogContext(cwd, sessionName);
@@ -138,23 +142,29 @@ export async function handleUserPrompt(): Promise<void> {
     process.exit(0);
   }
 
-  // Decide whether to refresh: TTL expired or message threshold hit
+  // Decide whether to refresh: TTL expired, message threshold hit, or alwaysFresh enabled
+  const retrieval = getRetrievalConfig();
+  const promptTopics = extractTopics(prompt);
+  const hasSearchableTopics = promptTopics.length > 0;
   const forceRefresh = shouldRefreshKnowledgeGraph();
   const cachedContext = getCachedUserContext();
   const cacheIsStale = isContextCacheStale();
+  // When alwaysFresh is enabled and the prompt has searchable topics, bypass the
+  // cache fast-path so the representation reflects the current prompt's relevance.
+  const skipCacheForRelevance = retrieval.alwaysFresh && hasSearchableTopics;
 
-  if (cachedContext && !cacheIsStale && !forceRefresh) {
+  if (cachedContext && !cacheIsStale && !forceRefresh && !skipCacheForRelevance) {
     // Fresh cache — serve instantly, no API call
     logCache("hit", "userContext", "fresh cache");
     verboseApiResult("peer.context() -> representation (cached)", cachedContext?.representation);
     verboseList("peer.context() -> peerCard (cached)", cachedContext?.peerCard);
 
-    serveContext(config.peerName, cachedContext, true, sessionLink);
+    serveContext(config.peerName, cachedContext, true, sessionLink, dedupSessionId);
     process.exit(0);
   }
 
-  // Cache is stale or threshold reached — try a fresh fetch with timeout
-  logCache("miss", "userContext", forceRefresh ? "threshold refresh" : "stale cache");
+  // Cache is stale, threshold reached, or relevance-fresh fetch requested — try a fresh fetch with timeout
+  logCache("miss", "userContext", forceRefresh ? "threshold refresh" : skipCacheForRelevance ? "relevance fresh" : "stale cache");
 
   const fetchResult = await Promise.race([
     fetchFreshContext(config, prompt).then(r => ({ ok: true as const, ...r })),
@@ -167,7 +177,7 @@ export async function handleUserPrompt(): Promise<void> {
       markKnowledgeGraphRefreshed();
     }
     if (context) {
-      serveContext(config.peerName, context, false, sessionLink);
+      serveContext(config.peerName, context, false, sessionLink, dedupSessionId);
       process.exit(0);
     }
   }
@@ -176,7 +186,7 @@ export async function handleUserPrompt(): Promise<void> {
   const staleContext = getStaleCachedUserContext();
   if (staleContext) {
     logHook("user-prompt", "Serving stale cache after timeout");
-    serveContext(config.peerName, staleContext, true, sessionLink);
+    serveContext(config.peerName, staleContext, true, sessionLink, dedupSessionId);
   }
   // No cache at all — exit silently, context will arrive after session-start completes
 
@@ -191,8 +201,9 @@ function serveContext(
   context: any,
   cached: boolean,
   sessionLink?: string,
+  dedupSessionId?: string,
 ): void {
-  const { parts: contextParts } = formatCachedContext(context, peerName);
+  const { parts: contextParts } = formatCachedContext(context, peerName, dedupSessionId);
   if (contextParts.length === 0) return;
 
   const visMsg = visContextLine("user-prompt", { cached });
@@ -202,6 +213,7 @@ function serveContext(
 async function fetchFreshContext(config: any, prompt: string): Promise<{ context: any }> {
   const honcho = new Honcho(getHonchoClientOptions(config));
   const observationMode = getObservationMode(config);
+  const retrieval = getRetrievalConfig();
 
   // unified: user self-observations — query via userPeer (no target).
   // directional: ai cross-observations — query via aiPeer with target.
@@ -213,34 +225,53 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
 
   const startTime = Date.now();
 
-  // Try search-based context first — returns conclusions relevant to the prompt
+  // Try search-based context first — returns conclusions relevant to the prompt.
+  // Fall back to the raw prompt (truncated) when no high-signal topics match:
+  // natural text embeds well, and it keeps non-English prompts working.
   const topics = extractTopics(prompt);
-  const searchQuery = topics.length > 0 ? topics.join(" ") : undefined;
+  const searchQuery = topics.length > 0 ? topics.join(" ") : prompt.trim().slice(0, 300);
 
   let contextResult: any = null;
 
   if (searchQuery) {
     try {
-      contextResult = await contextPeer.context({
-        ...(contextTarget ? { target: contextTarget } : {}),
-        searchQuery,
-        searchTopK: 5,
-        searchMaxDistance: 0.85,
-        maxConclusions: 15,
-        includeMostFrequent: true,
-      });
-      logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)}`, Date.now() - startTime, true);
+      // The representation merges search hits with frequent/recent conclusions
+      // into one timestamp-ordered string, so prompt-relevant lines get lost.
+      // Query matched conclusions separately and let the formatter put them first.
+      // Thresholds come from retrieval config (searchMaxDistance/topK/maxConclusions);
+      // includeMostFrequent stays false so frequency pinning can't crowd out relevance.
+      const conclusionScope = contextTarget
+        ? contextPeer.conclusionsOf(contextTarget)
+        : contextPeer.conclusions;
+      const [ctx, matched] = await Promise.all([
+        contextPeer.context({
+          ...(contextTarget ? { target: contextTarget } : {}),
+          searchQuery,
+          searchTopK: retrieval.searchTopK,
+          searchMaxDistance: retrieval.searchMaxDistance,
+          maxConclusions: retrieval.maxConclusions,
+          includeMostFrequent: false,
+        }),
+        conclusionScope.query(searchQuery, retrieval.searchTopK).catch((): any[] => []),
+      ]);
+      contextResult = ctx;
+      if (contextResult && matched?.length) {
+        contextResult.searchMatched = matched.map((c: any) => c.content).filter(Boolean);
+      }
+      logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)} (d<=${retrieval.searchMaxDistance})`, Date.now() - startTime, true);
     } catch (e) {
       // Search failed — fall through to static context
       logHook("user-prompt", `Search context failed, falling back to static: ${e}`);
     }
   }
 
-  // Fallback: static context (no search query)
+  // Fallback: static context (no search query, or search threw an error).
+  // Note: an empty search result is NOT a failure — it means "no relevant
+  // conclusions for this prompt" and we honor that by skipping the static fallback.
   if (!contextResult) {
     contextResult = await contextPeer.context({
       ...(contextTarget ? { target: contextTarget } : {}),
-      maxConclusions: 15,
+      maxConclusions: retrieval.maxConclusions,
       includeMostFrequent: true,
     });
     logApiCall(contextLabel, "GET", `static context`, Date.now() - startTime, true);
@@ -255,22 +286,79 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
   return { context: contextResult };
 }
 
-function formatCachedContext(context: any, peerName: string): { parts: string[]; conclusionCount: number } {
+export function stripConclusionLine(line: string): string {
+  return line.replace(/^\[.*?\]\s*/, "").replace(/^- /, "").trim();
+}
+
+export function formatCachedContext(context: any, peerName: string, dedupSessionId?: string): { parts: string[]; conclusionCount: number } {
   const parts: string[] = [];
   let conclusionCount = 0;
+  let totalDropped = 0;
   const rep = context?.representation;
+  const retrieval = getRetrievalConfig();
+
+  // Cross-turn dedup (#40): one shared hash set, seeded from what this session has
+  // already injected, so a conclusion never repeats turn after turn. Conclusions
+  // and the Profile below share it and we record() once at the end — recording per
+  // block would double-increment the session turn counter.
+  const alreadyHashed = dedupSessionId ? getInjectedHashesForSession(dedupSessionId) : null;
+  const freshHashes: string[] = [];
+
+  // Within-turn ordering (#63): prompt-matched conclusions first (semantic search),
+  // then the newest representation lines. The representation is oldest-first, so
+  // taking its head would inject the stalest facts.
+  const seen = new Set<string>();
+  const accept = (text: string, cap: number, out: string[]): void => {
+    const clean = stripConclusionLine(text);
+    if (!clean || out.length >= cap) return;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+    const hash = hashLine(normalizeLine(text));
+    if (alreadyHashed?.has(hash)) {
+      totalDropped = totalDropped + 1;
+      return;
+    }
+    seen.add(key);
+    out.push(clean);
+    if (alreadyHashed) {
+      alreadyHashed.add(hash);
+      freshHashes.push(hash);
+    }
+  };
+
+  const selected: string[] = [];
+  for (const c of context?.searchMatched ?? []) accept(String(c), retrieval.displayLimit, selected);
 
   if (typeof rep === "string" && rep.trim()) {
     const lines = rep.split("\n").filter((l: string) => l.trim() && !l.startsWith("#"));
-    const selected = lines.slice(0, 5);
-    conclusionCount = selected.length;
-    const summary = selected.map((l: string) => l.replace(/^\[.*?\]\s*/, "").replace(/^- /, "")).join("; ");
-    if (summary) parts.push(`Relevant conclusions: ${summary}`);
+    // Sort newest-first when lines carry a leading [timestamp]; otherwise keep order.
+    const stamped = lines.map((l: string, i: number) => ({ l, t: l.match(/^\[([^\]]+)\]/)?.[1] ?? "", i }));
+    stamped.sort((a, b) => (b.t.localeCompare(a.t)) || (a.i - b.i));
+    for (const { l } of stamped) accept(l, retrieval.displayLimit, selected);
   }
 
+  if (selected.length > 0) {
+    conclusionCount = selected.length;
+    parts.push(`Relevant conclusions: ${selected.join("; ")}`);
+  }
+
+  // Profile (peer card): same dedup gate. On the first turn the whole card is
+  // fresh; on later turns its lines are already hashed, so it collapses to nothing.
   const peerCard = context?.peerCard;
   if (peerCard?.length) {
-    parts.push(`Profile: ${peerCard.join("; ")}`);
+    const selectedPeerCard: string[] = [];
+    for (const line of peerCard) accept(String(line), peerCard.length, selectedPeerCard);
+    if (selectedPeerCard.length > 0) {
+      parts.push(`Profile: ${selectedPeerCard.join("; ")}`);
+    }
+  }
+
+  if (dedupSessionId && freshHashes.length > 0) {
+    recordInjectedHashes(dedupSessionId, freshHashes);
+  }
+
+  if (totalDropped > 0 && isLoggingEnabled()) {
+    logHook("user-prompt", `Dedup dropped ${totalDropped} already-injected line(s) for session ${dedupSessionId}`);
   }
 
   return { parts, conclusionCount };
