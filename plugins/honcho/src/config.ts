@@ -48,6 +48,8 @@ export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "max";
 
 export type SessionStrategy = "per-directory" | "git-branch" | "chat-instance";
 
+export type StatuslineMode = "on" | "off";
+
 export type HonchoEnvironment = "production" | "local";
 
 export interface HonchoEndpointConfig {
@@ -75,6 +77,13 @@ export interface HostConfig {
   workspace?: string;
   /** AI peer name for this host (e.g. "claude", "cursor") */
   aiPeer?: string;
+  /**
+   * Honcho API key scoped to this host. Takes precedence over the root
+   * `apiKey` field, but is still overridden by the HONCHO_API_KEY env var.
+   * Useful when different hosts (claude_code, cursor, opencode) authenticate
+   * against different Honcho orgs or workspaces.
+   */
+  apiKey?: string;
 
   /** Per-host overrides for settings that may differ across tools */
   enabled?: boolean;
@@ -190,6 +199,8 @@ interface HonchoFileConfig {
   reasoningLevel?: ReasoningLevel;
   /** Observation mode (default: "unified") */
   observationMode?: ObservationMode;
+  /** Memory statusLine visibility: "on" (default) · "off" */
+  statusline?: StatuslineMode;
   hosts?: Record<string, HostConfig>;
   /** When true, flat workspace/aiPeer fields apply to ALL hosts,
    *  ignoring host-specific blocks. When false (default), each host
@@ -229,6 +240,8 @@ export interface HonchoCLAUDEConfig {
    * "directional": this AI keeps its own per-AI view of the user.
    */
   observationMode?: ObservationMode;
+  /** Memory statusLine visibility: "on" (default) · "off" */
+  statusline?: StatuslineMode;
   /** Token-based upload limits */
   messageUpload?: MessageUploadConfig;
   /** Context retrieval settings */
@@ -296,7 +309,12 @@ export function loadConfig(host?: HonchoHost): HonchoCLAUDEConfig | null {
 }
 
 function resolveConfig(raw: HonchoFileConfig, host: HonchoHost): HonchoCLAUDEConfig | null {
-  const apiKey = process.env.HONCHO_API_KEY || raw.apiKey;
+  const hostBlock = raw.hosts?.[host]
+    ?? raw.hosts?.[host.replace(/_/g, "-")]
+    ?? raw.hosts?.[host.replace(/-/g, "_")];
+
+  // Resolution order: env var > host-scoped apiKey > root apiKey.
+  const apiKey = process.env.HONCHO_API_KEY || hostBlock?.apiKey || raw.apiKey;
   if (!apiKey) return null;
 
   const peerName = raw.peerName || process.env.HONCHO_PEER_NAME || process.env.USER || process.env.USERNAME || "user";
@@ -304,10 +322,6 @@ function resolveConfig(raw: HonchoFileConfig, host: HonchoHost): HonchoCLAUDECon
   // Resolve host-specific fields
   let workspace: string;
   let aiPeer: string;
-
-  const hostBlock = raw.hosts?.[host]
-    ?? raw.hosts?.[host.replace(/_/g, "-")]
-    ?? raw.hosts?.[host.replace(/-/g, "_")];
 
   if (raw.globalOverride === true) {
     // Global override: flat fields apply to ALL hosts
@@ -505,6 +519,13 @@ export function saveConfig(config: HonchoCLAUDEConfig): void {
   setHostIfExplicit("localContext", config.localContext, existing.localContext);
   setHostIfExplicit("retrieval", config.retrieval, existing.retrieval);
   setHostIfExplicit("endpoint", config.endpoint, existing.endpoint);
+
+  // Preserve a host-scoped apiKey already on disk. This integration never writes
+  // apiKey (config.apiKey is the *resolved* key — env/root — and must not be
+  // materialized here), but must not drop hosts.<host>.apiKey on rewrite.
+  if (existingHost.apiKey !== undefined) {
+    hostEntry.apiKey = existingHost.apiKey;
+  }
 
   existing.hosts[host] = hostEntry;
 
