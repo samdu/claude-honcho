@@ -451,7 +451,6 @@ The plugin hooks into Claude Code's lifecycle events:
 - **SessionStart**: Loads your context and history from Honcho
 - **UserPrompt**: Saves your messages and retrieves relevant context
 - **PostToolUse**: Logs Claude's actions (file edits, commands, etc.)
-- **PreCompact**: Anchors a memory snapshot before context compaction so knowledge survives summarization
 - **Stop**: Flushes any pending messages
 - **SessionEnd**: Uploads remaining messages and generates a summary
 

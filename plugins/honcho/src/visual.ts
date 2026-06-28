@@ -6,7 +6,7 @@
  * - PostToolUse — visCapture() outputs JSON with systemMessage
  * - Stop — visStopMessage() outputs JSON with systemMessage
  *
- * SessionStart, SessionEnd, and PreCompact output plain text to stdout (context injection),
+ * SessionStart and SessionEnd output plain text to stdout (context injection),
  * so they cannot show inline indicators. Their activity is logged to the verbose log file only.
  */
 
@@ -97,7 +97,7 @@ export function addSystemMessage(existingJson: any, message: string): any {
 // NOTE: This file-based verbose output is used by SessionStart and
 // UserPromptSubmit hooks, where stdout is always visible to Claude
 // (not just in Ctrl+O). For hooks where stdout is only shown in
-// Ctrl+O (PreCompact, PostToolUse, Stop, SessionEnd), prefer
+// Ctrl+O (PostToolUse, Stop, SessionEnd), prefer
 // printing verbose data to stdout instead — use formatVerboseBlock().
 // ============================================
 
@@ -164,14 +164,14 @@ export function getVerboseLogPath(): string {
 // Stdout-based verbose output — for Ctrl+O visibility
 //
 // In Claude Code, Ctrl+O toggles visibility of hook stdout.
-// For hooks where stdout is only shown in Ctrl+O (PreCompact,
-// PostToolUse, Stop, SessionEnd), we can print verbose data
+// For hooks where stdout is only shown in Ctrl+O (PostToolUse,
+// Stop, SessionEnd), we can print verbose data
 // directly to stdout so it appears when the user presses Ctrl+O.
 // ============================================
 
 /**
  * Format verbose API response data as a plain-text block for stdout.
- * Use in hooks where stdout is only visible in Ctrl+O (PreCompact, Stop, etc.).
+ * Use in hooks where stdout is only visible in Ctrl+O (Stop, etc.).
  * Returns empty string if data is null/undefined.
  */
 export function formatVerboseBlock(label: string, data: string | null | undefined): string {
@@ -183,7 +183,7 @@ export function formatVerboseBlock(label: string, data: string | null | undefine
 
 /**
  * Format a list of items as a plain-text block for stdout.
- * Use in hooks where stdout is only visible in Ctrl+O (PreCompact, Stop, etc.).
+ * Use in hooks where stdout is only visible in Ctrl+O (Stop, etc.).
  * Returns empty string if items is null/undefined/empty.
  */
 export function formatVerboseList(label: string, items: string[] | null | undefined): string {

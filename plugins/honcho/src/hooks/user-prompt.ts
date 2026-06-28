@@ -96,7 +96,6 @@ function readVersionNag(): string | undefined {
  * Context lifecycle:
  *   SessionStart  -> warms cache (parallel API calls, 30s budget)
  *   UserPrompt    -> serves cache; refreshes (with 4s timeout) when TTL expires or message threshold hit
- *   PreCompact    -> re-warms cache before context window reset
  *
  * On refresh failure, silently falls back to stale cache.
  * On no cache at all, exits silently — context will arrive next turn.
